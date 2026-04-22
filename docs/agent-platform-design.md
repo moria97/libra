@@ -511,9 +511,13 @@ Agent 沙箱需要保证：(1) 已安装的依赖不随休眠丢失，(2) 中间
 
 **Layer 2: Skill Image**（按 AgentSpec 构建）：平台根据 skill manifest 的依赖列表构建中间镜像层，**相同 skill 组合的 agent 共享同一镜像**（缓存 key = `sha256(sorted_skill_deps)`）。
 
-**Layer 3: PV /workspace**：Agent 运行期间 `pip install` 的额外依赖、生成的中间文件、下载的数据等写入 PV。**休眠时 Pod 销毁但 PV 保留**，唤醒时新 Pod 挂载同一 PV。
+**Layer 3: PV /workspace**：Agent 运行期间 `pip install` 的额外依赖、生成的中间文件、下载的数据等写入 PV。**休眠时 Pod 销毁但 PV 保留**，唤醒时新 Pod 挂载同一 PV。Agent runtime 自动维护 `requirements.lock` 记录所有 pip install 操作，存到 `/agent-state/`，PV 损坏时可从 lock 文件重装。
 
 **Layer 4: PV /agent-state**：Agent 配置、skill 运行时状态、checkpoint。与 workspace 分离，便于独立备份和迁移。
+
+**PV 存储注意事项：**
+- 使用 ReadWriteMany 存储（如 NFS/EFS/CephFS）确保跨 node 调度时 PV 可挂载。MVP 阶段推荐 EFS (AWS) 或 NFS。
+- 长期休眠的 agent 分级处理存储成本：< 1h PV 在线（< 5s 唤醒）；1h-7d 降级到低成本存储类（< 10s）；> 7d 快照到 S3 + 释放 PV（30-60s 唤醒）。
 
 ### Skill 文件依赖加载
 
@@ -684,8 +688,9 @@ spec:
 ```
 
 - 文件存在 S3，通过 PV 或 sidecar 挂载到沙箱
-- 支持自动同步——源文件更新时 Agent 自动获取最新版本
+- 支持自动同步——源文件更新时 Agent 自动获取最新版本（通过 S3 Event Notification 触发）
 - 适合团队知识库、产品文档等场景
+- **Knowledge Indexer**（自动触发）：上传文件 → 提取文本 + 切片 + 向量化 → 写入 Memory Service (L3)。Agent 既能做语义检索（"找关于XX的文档段落"），也能直接读取原始文件。
 
 ### 方式 C：外部数据源连接器（v1+）
 
