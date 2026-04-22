@@ -490,12 +490,69 @@ Platform
     └── Memory Store
 ```
 
+### 沙箱存储架构：分层镜像 + 持久卷
+
+Agent 沙箱需要保证：(1) 已安装的依赖不随休眠丢失，(2) 中间文件可持久保存，(3) Skill 文件依赖可靠加载。
+
+核心方案：**K8s Pod + PersistentVolume**，而非纯临时容器。
+
+```
+┌─────────────────────────────────┐
+│        Agent 沙箱 (Pod)          │
+│                                  │
+│  Layer 1: Base Image (只读)      │  ← Python runtime + 基础库
+│  Layer 2: Skill Image (只读)     │  ← 预构建的 skill 依赖层
+│  Layer 3: PV /workspace (读写)   │  ← 用户安装的依赖 + 中间文件
+│  Layer 4: PV /agent-state (读写) │  ← agent 配置 + skill 运行时状态
+└─────────────────────────────────┘
+```
+
+**Layer 1: Base Image**（平台维护）：包含 Python、Node.js 等 runtime + 常见依赖。不同安全级别可选不同 base image。
+
+**Layer 2: Skill Image**（按 AgentSpec 构建）：平台根据 skill manifest 的依赖列表构建中间镜像层，**相同 skill 组合的 agent 共享同一镜像**（缓存 key = `sha256(sorted_skill_deps)`）。
+
+**Layer 3: PV /workspace**：Agent 运行期间 `pip install` 的额外依赖、生成的中间文件、下载的数据等写入 PV。**休眠时 Pod 销毁但 PV 保留**，唤醒时新 Pod 挂载同一 PV。
+
+**Layer 4: PV /agent-state**：Agent 配置、skill 运行时状态、checkpoint。与 workspace 分离，便于独立备份和迁移。
+
+### Skill 文件依赖加载
+
+```
+Skill Registry (S3/OCI)
+        │
+        ▼ skill install 时
+   Sandbox Manager
+   ├── 拉取 skill 包
+   ├── 解压到 /agent-state/skills/{skill-name}/
+   ├── 执行 skill 的 setup.sh（安装依赖到 /workspace/venv/）
+   └── 注册 tool schema 到 Agent Runtime
+        │
+        ▼ 休眠后唤醒
+   /agent-state/skills/ 仍在 PV 上
+   → Agent Runtime 启动时扫描已安装 skill → 直接加载，无需重装
+```
+
 ### 休眠 & 唤醒
 
 Agent 空闲时保存 memory state → 释放计算资源，收到消息时秒级唤醒：
 
+```
+休眠：
+  1. Agent Runtime 优雅停止（flush 缓存、保存状态）
+  2. Pod 销毁（释放 CPU/内存）
+  3. PV 保留（/workspace + /agent-state 不动）
+  4. 镜像 tag 记录在 AgentSpec.status 中
+
+唤醒：
+  1. 从 AgentSpec.status 读取镜像 tag
+  2. 创建新 Pod，挂载原 PV
+  3. Agent Runtime 启动，检测 /agent-state 存在 → 恢复模式
+  4. 所有依赖、中间文件、skill 状态原封不动
+  → 对用户来说，就像 Agent 一直在运行
+```
+
 - **Memory state**（L2/L3 记忆）：持久化在 PG/pgvector，不随休眠丢失
-- **Runtime state**（进程状态、临时文件）：MVP 阶段直接丢弃，唤醒后从 memory 恢复；Phase 3 加 checkpoint
+- **Runtime state**（进程状态、临时文件）：MVP 阶段"丢弃 runtime + PV 恢复"模式；Phase 3 加进程级 checkpoint
 
 **关键性能指标：** 冷启动（休眠→唤醒）< 5秒，通过预热 Pod 池 + 分层镜像实现。
 
@@ -593,6 +650,70 @@ NATS: "agent.routing.delegate"     NATS: "agent.{B}.messages"
 - **用户自定义**：支持上传自定义 MCP Server 扩展能力
 
 每个 skill 带有语义标签、依赖关系、资源需求，支持版本管理和权限控制。
+
+---
+
+## 11.5 用户数据与知识库集成
+
+Agent 常需要访问用户的本地文件、Wiki、文档库。提供三种集成方式：
+
+### 方式 A：IM 直接上传（MVP）
+
+用户在飞书/钉钉群里直接发送文件（PDF/Word/图片/代码），IM Gateway 接收后存入 S3，挂载到 Agent 的 `/workspace/uploads/`。Agent 自动感知新文件并加载到上下文或知识库。
+
+- 对用户零门槛——发文件就行
+- 适合少量文件场景
+
+### 方式 B：Knowledge Volume（Phase 2）
+
+用户通过 Web 管理后台或 API 批量上传文件，绑定到 Agent：
+
+```yaml
+# AgentSpec 扩展
+spec:
+  knowledge:
+    volumes:
+      - name: "product-docs"
+        source: s3://tenant-123/knowledge/product-docs/
+        mount: /workspace/knowledge/product-docs
+        sync: on_change    # 源文件变化时自动同步
+      - name: "wiki-export"
+        source: s3://tenant-123/knowledge/wiki/
+        mount: /workspace/knowledge/wiki
+        sync: manual       # 手动触发同步
+```
+
+- 文件存在 S3，通过 PV 或 sidecar 挂载到沙箱
+- 支持自动同步——源文件更新时 Agent 自动获取最新版本
+- 适合团队知识库、产品文档等场景
+
+### 方式 C：外部数据源连接器（v1+）
+
+Agent 通过 MCP Skill 直接连接用户的外部系统（Notion、Confluence、GitHub Wiki、Google Drive 等）：
+
+```yaml
+spec:
+  skills:
+    - name: notion-connector
+      config:
+        workspace_id: "xxx"
+        api_key: "${secrets.NOTION_KEY}"  # 加密存储
+    - name: confluence-connector
+      config:
+        base_url: "https://company.atlassian.net"
+        api_token: "${secrets.CONFLUENCE_TOKEN}"
+```
+
+- Agent 实时拉取最新内容，不需要手动同步
+- 凭证通过平台 Secrets Manager 加密存储
+
+### 优先级
+
+| 方式 | 阶段 | 复杂度 | 用户体验 |
+|---|---|---|---|
+| **A: IM 上传** | MVP (Phase 1) | 低 | 发文件即可，零门槛 |
+| **B: Knowledge Volume** | Phase 2 | 中 | 批量上传 + 自动同步 |
+| **C: 外部连接器** | Phase 3 (v1) | 高 | 实时连接，最强大 |
 
 ---
 
