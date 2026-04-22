@@ -887,6 +887,144 @@ CREATE TABLE skills (
 
 ---
 
+## 14.5 Provider 抽象架构
+
+平台采用 **Provider 插件化**设计，每个核心层定义统一接口，由不同 Provider 实现。目标：开源社区可在任意环境（单机/云/混合）部署，不绑定特定云厂商。
+
+### 14.5.1 Provider 分层
+
+| 层 | 接口名 | 职责 | MVP Provider | 扩展 Provider |
+|---|---|---|---|---|
+| **Runtime** | `RuntimeProvider` | Agent 实例的生命周期管理（创建/启动/停止/销毁） | 单机 Docker | K8s、Nomad、ECS |
+| **Sandbox** | `SandboxProvider` | 代码执行隔离、syscall 控制 | gVisor (本地) | E2B、Kata Containers、Firecracker、云厂商沙箱 |
+| **Storage** | `StorageProvider` | 文件持久化（Agent 工作区、快照、附件） | 本地目录 | S3、Aliyun OSS、MinIO、GCS |
+| **Model** | `ModelProvider` | LLM 调用抽象（chat/completion/embedding） | OpenAI API | Claude、本地模型（Ollama）、Azure OpenAI、各云厂商 LLM |
+| **Memory** | `MemoryProvider` | Agent 记忆存储与检索 | SQLite + 本地向量（hnswlib） | PG+pgvector、Redis、Qdrant、云向量DB |
+| **Messaging** | `MessagingProvider` | 平台内部异步消息通信 | 内存队列 | NATS JetStream、Kafka、RabbitMQ |
+| **IM** | `IMProvider` | 外部 IM 平台对接 | 飞书 | 钉钉、Slack、Discord、企业微信 |
+
+### 14.5.2 核心接口示例
+
+```go
+// RuntimeProvider — Agent 运行时管理
+type RuntimeProvider interface {
+    Create(ctx context.Context, spec AgentSpec) (Instance, error)
+    Start(ctx context.Context, instanceID string) error
+    Stop(ctx context.Context, instanceID string) error
+    Destroy(ctx context.Context, instanceID string) error
+    Status(ctx context.Context, instanceID string) (InstanceStatus, error)
+}
+
+// StorageProvider — 文件存储抽象
+type StorageProvider interface {
+    Put(ctx context.Context, key string, data io.Reader) error
+    Get(ctx context.Context, key string) (io.ReadCloser, error)
+    Delete(ctx context.Context, key string) error
+    List(ctx context.Context, prefix string) ([]ObjectInfo, error)
+}
+
+// ModelProvider — LLM 调用抽象
+type ModelProvider interface {
+    Chat(ctx context.Context, req ChatRequest) (ChatResponse, error)
+    Embed(ctx context.Context, texts []string) ([][]float32, error)
+    ListModels(ctx context.Context) ([]ModelInfo, error)
+}
+```
+
+每个 Provider 接口保持 **3-5 个核心方法**，从至少 2 个实际实现中提炼，避免过度抽象。
+
+### 14.5.3 平台配置（platform.yaml）
+
+AgentSpec 描述单个 Agent，`platform.yaml` 描述平台级的 Provider 选型与配置：
+
+```yaml
+# platform.yaml — 平台 Provider 配置
+version: "1"
+
+providers:
+  runtime:
+    type: docker           # docker | k8s | nomad
+    config:
+      socket: /var/run/docker.sock
+
+  sandbox:
+    type: gvisor           # gvisor | e2b | kata | firecracker
+    config:
+      runtime_class: runsc
+
+  storage:
+    type: local            # local | s3 | oss | minio
+    config:
+      base_path: /data/agents
+
+  model:
+    type: openai           # openai | claude | ollama | azure
+    config:
+      api_key: ${OPENAI_API_KEY}
+      default_model: gpt-4o
+
+  memory:
+    type: sqlite           # sqlite | postgres | qdrant
+    config:
+      db_path: /data/memory.db
+
+  messaging:
+    type: memory           # memory | nats | kafka
+    config: {}
+
+  im:
+    - type: feishu         # feishu | dingtalk | slack | discord
+      config:
+        app_id: ${FEISHU_APP_ID}
+        app_secret: ${FEISHU_APP_SECRET}
+```
+
+### 14.5.4 部署拓扑
+
+**单机模式（开发/个人使用）：**
+```
+Docker Compose 一键启动
+├── Platform Service (Go)
+├── Agent Runtime (Python, gVisor 容器)
+├── SQLite (Memory + 元数据)
+├── 本地目录 (Storage)
+└── 内存队列 (Messaging)
+```
+
+**集群模式（团队/企业）：**
+```
+K8s 集群
+├── Platform Service (Deployment, 多副本)
+├── Agent Runtime (Pod per agent, gVisor/Kata RuntimeClass)
+├── PostgreSQL + pgvector (Memory + 元数据)
+├── S3/OSS/MinIO (Storage)
+├── NATS JetStream (Messaging)
+├── Redis (缓存)
+├── Temporal (Workflow)
+└── Kong/APISIX (API Gateway)
+```
+
+### 14.5.5 Provider 优先级
+
+实现顺序按对平台可用性的影响排序：
+
+1. **Runtime** — 决定 Agent 能否运行（Docker → K8s）
+2. **Storage** — 决定数据在哪里存（本地 → S3/OSS）
+3. **Model** — 决定 LLM 调用通路（OpenAI → Claude → 本地）
+4. **Sandbox** — 决定隔离级别（gVisor → E2B/Kata）
+5. **Memory** — 决定记忆容量与性能（SQLite → PG+pgvector）
+6. **Messaging** — 决定通信吞吐（内存 → NATS）
+7. **IM** — 决定入口渠道（飞书 → 钉钉 → Slack）
+
+### 14.5.6 设计原则
+
+- **MVP 零外部依赖**：默认 Provider 全部用本地/内嵌实现，`docker compose up` 即可运行
+- **渐进式替换**：改一行 `platform.yaml` 即可切换 Provider，无需改代码
+- **接口最小化**：先实现再抽象，从 2+ 个具体实现中提炼通用接口
+- **Provider 独立发版**：每个 Provider 作为独立 Go module，按需引入，不膨胀核心包
+
+---
+
 ## 15. 企业级管理
 
 - **多租户**：Organization → Workspace → Agent 三级隔离
@@ -969,8 +1107,10 @@ CREATE TABLE skills (
 2. **GitHub Repo**：是否需要新建独立 repo？
 3. **MVP 第一个 IM**：先做飞书还是钉钉？
 4. **Agent Runtime 语言**：沙箱内 runtime 用 Python 还是也支持其他语言？
-5. **模型默认值**：v0 默认用 Claude 还是做 pluggable？
-6. **开源策略**：完全开源还是 open-core？
+5. **模型默认值**：v0 默认用 Claude 还是做 pluggable？→ 已确认：Provider 化，MVP 默认 OpenAI，可切换
+6. **开源策略**：完全开源还是 open-core？→ 已确认方向：开源 platform 服务
+7. **Provider 接口粒度**：各层 Provider 接口的具体方法定义需要在实现中迭代确认
+8. **部署基线**：MVP 单机模式的最低硬件要求？
 
 ---
 
